@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'screens/dashboard.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -78,10 +79,12 @@ class _BleScannerPageState extends State<BleScannerPage> {
             subtitle: Text(device.remoteId.toString()),
             trailing: const Icon(Icons.bluetooth),
             onTap: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text("Kliknięto: ${device.platformName}")),
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => DashboardPage(device: device),
+                ),
               );
-              // TODO: Połączenie lub przejście dalej
             },
           );
         },
