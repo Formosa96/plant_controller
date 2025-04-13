@@ -42,17 +42,14 @@ class _BleScannerPageState extends State<BleScannerPage> {
   }
 
   Future<void> startBLEScan() async {
-    // 📲 Prośba o uprawnienia
     await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
       Permission.locationWhenInUse,
     ].request();
 
-    // 🔍 Rozpoczęcie skanowania
     await FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
 
-    // 🎯 Nasłuchiwanie wyników
     FlutterBluePlus.scanResults.listen((r) {
       setState(() {
         results = r;
@@ -64,10 +61,10 @@ class _BleScannerPageState extends State<BleScannerPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('BLE – Wybierz urządzenie'),
+        title: const Text('Choose BLE device'),
       ),
       body: results.isEmpty
-          ? const Center(child: Text("Skanuję... 🛰️"))
+          ? const Center(child: Text("Scanning"))
           : ListView.builder(
         itemCount: results.length,
         itemBuilder: (context, index) {
@@ -75,7 +72,7 @@ class _BleScannerPageState extends State<BleScannerPage> {
           return ListTile(
             title: Text(device.platformName.isNotEmpty
                 ? device.platformName
-                : "(Brak nazwy)"),
+                : "(No name)"),
             subtitle: Text(device.remoteId.toString()),
             trailing: const Icon(Icons.bluetooth),
             onTap: () {
