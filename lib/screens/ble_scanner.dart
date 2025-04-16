@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'dashboard.dart';
+import 'network_config.dart';
 
 class BleScannerPage extends StatefulWidget {
   const BleScannerPage({super.key});
@@ -20,17 +21,14 @@ class _BleScannerPageState extends State<BleScannerPage> {
   }
 
   Future<void> startBLEScan() async {
-    // 🔓 Uprawnienia
     await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
       Permission.locationWhenInUse,
     ].request();
 
-    // 🔍 Rozpocznij skanowanie
     await FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
 
-    // 📡 Nasłuchuj wyników
     FlutterBluePlus.scanResults.listen((r) {
       setState(() {
         results = r
@@ -39,6 +37,49 @@ class _BleScannerPageState extends State<BleScannerPage> {
       });
     });
   }
+
+
+
+  void _showDeviceOptions(BluetoothDevice device) {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.wifi),
+              title: const Text('Config network'),
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => NetworkConfigPage(device: device),
+                  ),
+                );
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.bluetooth),
+              title: const Text('BT pilot'),
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => DashboardPage(device: device),
+                  ),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+
 
   @override
   Widget build(BuildContext context) {
@@ -58,7 +99,7 @@ class _BleScannerPageState extends State<BleScannerPage> {
         ],
       ),
       body: results.isEmpty
-          ? const Center(child: Text("Scanning..."))
+          ? const Center(child: Text("Scanning"))
           : ListView.builder(
         itemCount: results.length,
         itemBuilder: (context, index) {
@@ -67,14 +108,7 @@ class _BleScannerPageState extends State<BleScannerPage> {
             title: Text(device.platformName),
             subtitle: Text(device.remoteId.toString()),
             trailing: const Icon(Icons.bluetooth),
-            onTap: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => DashboardPage(device: device),
-                ),
-              );
-            },
+            onTap: () => _showDeviceOptions(device),
           );
         },
       ),

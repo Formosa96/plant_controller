@@ -54,7 +54,7 @@ class _DashboardPageState extends State<DashboardPage> {
 
     if (humidityChar != null) {
       await humidityChar!.setNotifyValue(true);
-      humidityChar!.lastValueStream.listen((value) {
+        humidityChar!.lastValueStream.listen((value) {
         if (value.length >= 2) {
           int val = value[0] | (value[1] << 8);
           setState(() => humidity = val);
