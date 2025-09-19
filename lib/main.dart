@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'screens/ble_scanner.dart';
+import 'screens/welcome_screen.dart';
 
 void main() {
   runApp(const MyApp());
@@ -18,7 +18,7 @@ class MyApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
         useMaterial3: true,
       ),
-      home: const BleScannerPage(),
+      home: const WelcomeScreen(),
     );
   }
 }
