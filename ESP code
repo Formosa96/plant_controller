@@ -1,0 +1,484 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <BH1750.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <Preferences.h>
+#include <esp_mac.h>
+#include <WiFi.h>
+
+static const int LED_PIN   = 25;  
+static const int PUMP_PIN  = 26;  
+static const int SOIL_ADC  = 34;  
+static const int SDA_PIN   = 19;   
+static const int SCL_PIN   = 18;   
+
+
+static const int LEDC_FREQ = 5000;
+static const int LEDC_RES  = 8;    // duty 0..255
+
+#define SERVICE_UUID         "1234AA00-0000-1000-8000-00805f9b34fb"
+#define CHAR_UUID_HUMIDITY   "12340001-0000-1000-8000-00805f9b34fb"  // uint16 LE (ADC)
+#define CHAR_UUID_LIGHT      "12340002-0000-1000-8000-00805f9b34fb"  // uint16 LE (lux, clipped)
+#define CHAR_UUID_LED        "12340003-0000-1000-8000-00805f9b34fb"  // u8 (0..255)
+#define CHAR_UUID_PUMP       "12340004-0000-1000-8000-00805f9b34fb"  // u8 (0/1)
+#define CHAR_UUID_WIFI_SSID  "12340005-0000-1000-8000-00805f9b34fb"  // write
+#define CHAR_UUID_WIFI_PASS  "12340006-0000-1000-8000-00805f9b34fb"  // write
+#define CHAR_UUID_NAME       "12340007-0000-1000-8000-00805f9b34fb"  // read/write
+#define CHAR_UUID_TIME       "12340008-0000-1000-8000-00805f9b34fb"  // write: int64 unixUTC LE + int16 tzMin LE
+#define CHAR_UUID_PROFILE    "12340009-0000-1000-8000-00805f9b34fb"  // write/read: [u8 light, u8 water, u8 dltHours]
+#define CHAR_UUID_MODE       "1234000A-0000-1000-8000-00805f9b34fb"  // read/write/notify: u8 (0=MANUAL,1=AUTO)
+
+BLECharacteristic *humidityChar;
+BLECharacteristic *lightChar;
+BLECharacteristic *ledChar;
+BLECharacteristic *pumpChar;
+BLECharacteristic *ssidChar;
+BLECharacteristic *passChar;
+BLECharacteristic *nameChar;
+BLECharacteristic *timeChar;
+BLECharacteristic *profileChar;
+BLECharacteristic *modeChar;
+
+BLEServer *pServer;
+BLEAdvertising *adv;
+
+BH1750 lightSensor;
+Preferences prefs;
+
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+bool pendingAdvRestart = false;
+bool wifiConnectedPrinted = false;
+
+unsigned long lastNotifyTime = 0;
+const unsigned long notifyInterval = 1000;
+
+char deviceName[32] = {0};  
+String ssid = "";
+String password = "";
+
+uint8_t  ledPWM = 0;        
+uint8_t  pumpState = 0;        
+volatile uint8_t autoMode = 0;  
+
+uint8_t  profLight = 2;    
+uint8_t  profWater = 1;      
+uint8_t  profDLT   = 12;      
+
+int64_t  appUnixUTC = 0;      
+int16_t  appTzMin   = 0;      
+
+float KP = 0.12f, KI = 0.02f;   
+float integ = 0.0f;
+
+uint16_t targetLux = 1500;   
+uint8_t  moistThreshPct = 35;   
+const    int ADC_WET = 900;     
+const    int ADC_DRY = 4095;     
+
+uint32_t litSecondsToday = 0;    
+uint32_t lastLitMs = 0;          
+uint32_t dltTargetSec() { return (uint32_t)profDLT * 3600UL; }
+
+unsigned long pumpCooldownUntil = 0;
+const unsigned long PUMP_RUN_MS = 6000;
+const unsigned long PUMP_COOLDOWN_MS = 5UL * 60UL * 1000UL;
+
+String sanitizeSuffix(const String &in, size_t maxLen = 15) {
+  String out; out.reserve(maxLen);
+  for (size_t i = 0; i < in.length() && out.length() < maxLen; ++i) {
+    char c = in[i];
+    if (isalnum((unsigned char)c) || c == '_' || c == '-') out += (char)tolower(c);
+    else if (c == ' ') out += '_';
+  }
+  return out;
+}
+
+void buildAndApplyAdvertising(const char *name) {
+  BLEAdvertisementData ad, sr;
+  ad.setCompleteServices(BLEUUID(SERVICE_UUID));
+  ad.setFlags(0x06);
+  sr.setName(name);
+
+  adv->stop();
+  adv->setAdvertisementData(ad);
+  adv->setScanResponseData(sr);
+  adv->setScanResponse(true);
+  adv->setMinPreferred(0x06);
+  adv->setMinPreferred(0x12);
+
+  if (!deviceConnected) adv->start();
+  else pendingAdvRestart = true;
+
+  Serial.printf("Advertising (re)configured with name: %s\n", name);
+}
+
+uint8_t soilPctFromAdc(int adc) {
+  float span = (float)(ADC_DRY - ADC_WET);
+  if (span < 1) return 0;
+  float pct = 100.0f * (ADC_DRY - (float)adc) / span;
+  if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+  return (uint8_t)(pct + 0.5f);
+}
+
+
+void applyProfileVars() {
+  switch (profLight) {
+    case 0: targetLux = 400;   break;   // Low
+    case 1: targetLux = 1500;  break;   // Medium
+    default: targetLux = 3000; break;  // High
+  }
+  switch (profWater) {
+    case 0: moistThreshPct = 25; break; // Low
+    case 1: moistThreshPct = 35; break; // Medium
+    default: moistThreshPct = 50; break; // High
+  }
+  Serial.printf("Profile set: light=%u (targetLux=%u), water=%u (moist%%=%u), DLT=%uh\n",
+                profLight, targetLux, profWater, moistThreshPct, profDLT);
+}
+
+int64_t nowLocalSec() {
+  if (appUnixUTC == 0) return (int64_t)(millis() / 1000);
+  return appUnixUTC + (int64_t)appTzMin * 60 + (int64_t)(millis() / 1000);
+}
+
+void maybeResetDailyBudget() {
+  static int lastDay = -1;
+  int64_t t = nowLocalSec();
+  int day = (t / 86400);
+  if (day != lastDay) {
+    litSecondsToday = 0;
+    lastDay = day;
+  }
+}
+
+bool canLightNow() {
+  int64_t t = nowLocalSec();
+  int secInDay = (int)(t % 86400);
+  int hour = secInDay / 3600;
+  return (hour >= 1 && hour < 23);
+}
+
+
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override { deviceConnected = true; }
+  void onDisconnect(BLEServer* pServer) override { deviceConnected = false; }
+};
+
+class LedCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String v = c->getValue();
+    if (v.length() > 0) {
+      uint8_t b = (uint8_t)v[0];
+      ledPWM = b;
+      ledcWrite(LED_PIN, ledPWM);
+      c->setValue(&ledPWM, 1);
+      Serial.printf("LED PWM write = %u (auto=%u)\n", ledPWM, autoMode);
+    }
+  }
+};
+
+class PumpCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String v = c->getValue();
+    if (v.length() > 0) {
+      pumpState = (uint8_t)(v[0] ? 1 : 0);
+      digitalWrite(PUMP_PIN, pumpState ? HIGH : LOW);
+      c->setValue(&pumpState, 1);
+      Serial.printf("PUMP write = %u (auto=%u)\n", pumpState, autoMode);
+    }
+  }
+};
+
+class SSIDCallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pChar) override {
+    ssid = pChar->getValue().c_str();
+    Serial.println("SSID received: " + ssid);
+  }
+};
+
+class PASSCallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pChar) override {
+    password = pChar->getValue().c_str();
+    Serial.println("Password received: " + password);
+
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", password);
+    prefs.end();
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), password.c_str());
+  }
+};
+
+class NAMECallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pChar) override {
+    String raw = pChar->getValue().c_str();
+    raw.trim();
+    if (raw.startsWith("garden_")) raw.remove(0, 7);
+    String suffix = sanitizeSuffix(raw, 15);
+    if (suffix.isEmpty()) { Serial.println("Invalid suffix"); return; }
+
+    prefs.begin("wifi", false);
+    prefs.putString("dev_suffix", suffix);
+    prefs.end();
+
+    String full = "garden_" + suffix;
+    full.toCharArray(deviceName, sizeof(deviceName));
+    buildAndApplyAdvertising(deviceName);
+
+    Serial.printf("Device name updated to: %s\n", deviceName);
+    Serial.println(deviceConnected ? "Will be visible after disconnect."
+                                   : "Advertising restarted with new name.");
+  }
+};
+
+class ModeCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String v = c->getValue();
+    if (v.length() > 0) {
+      autoMode = (uint8_t)(v[0] ? 1 : 0);
+      uint8_t tmp = autoMode;        // zdejmij volatile dla setValue
+      c->setValue(&tmp, 1);
+      c->notify();
+      Serial.printf("MODE set to %u\n", autoMode);
+      if (autoMode == 0) {
+        // Resetuj stan wykonawczy przy MANUAL
+        integ = 0.0f;                // reset PI
+        ledPWM = 0;
+        pumpState = 0;
+        ledcWrite(LED_PIN, 0);
+        digitalWrite(PUMP_PIN, LOW);
+      }
+    }
+  }
+};
+
+class TimeCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String v = c->getValue();
+    if (v.length() >= 10) {
+      const uint8_t* p = (const uint8_t*)v.c_str();
+      int64_t utc = 0;
+      int16_t tz = 0;
+      memcpy(&utc, p, 8);
+      memcpy(&tz,  p + 8, 2);
+      appUnixUTC = utc;
+      appTzMin   = tz;
+      Serial.printf("TIME set: utc=%lld, tzMin=%d\n", (long long)appUnixUTC, appTzMin);
+    }
+  }
+};
+
+class ProfileCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String v = c->getValue();
+    if (v.length() >= 3) {
+      profLight = (uint8_t)v[0]; if (profLight > 2) profLight = 2;
+      profWater = (uint8_t)v[1]; if (profWater > 2) profWater = 2;
+      profDLT   = (uint8_t)v[2]; if (profDLT > 24) profDLT = 24;
+      applyProfileVars();
+      uint8_t buf[3] = {profLight, profWater, profDLT};
+      c->setValue(buf, 3);
+      Serial.printf("PROFILE write: light=%u water=%u dlt=%u\n", profLight, profWater, profDLT);
+    }
+  }
+};
+
+void tryAutoConnect() {
+  prefs.begin("wifi", true);
+  String savedSsid   = prefs.getString("ssid", "");
+  String savedPass   = prefs.getString("pass", "");
+  String savedSuffix = prefs.getString("dev_suffix", "");
+  prefs.end();
+
+  if (savedSuffix.length() > 0) {
+    String full = "garden_" + sanitizeSuffix(savedSuffix, 15);
+    full.toCharArray(deviceName, sizeof(deviceName));
+  } else {
+    esp_bd_addr_t mac; esp_read_mac(mac, ESP_MAC_BT);
+    sprintf(deviceName, "garden_%02X%02X%02X", mac[3], mac[4], mac[5]);
+  }
+
+  if (savedSsid.length() && savedPass.length()) {
+    Serial.println("Found saved Wi-Fi credentials, trying to connect...");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
+
+  // LEDC – Twoje API
+  ledcAttach(LED_PIN, LEDC_FREQ, LEDC_RES);
+  ledcWrite(LED_PIN, 0);
+
+  // I2C + BH1750
+  Wire.begin(SDA_PIN, SCL_PIN);
+  if (lightSensor.begin()) Serial.println("BH1750 OK");
+  else                     Serial.println("BH1750 NOT OK");
+
+  tryAutoConnect();
+  applyProfileVars();
+
+  // BLE
+  BLEDevice::init(deviceName);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService *plantService = pServer->createService(BLEUUID(SERVICE_UUID), 40);
+
+  humidityChar = plantService->createCharacteristic(
+    CHAR_UUID_HUMIDITY, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  humidityChar->addDescriptor(new BLE2902());
+
+  lightChar = plantService->createCharacteristic(
+    CHAR_UUID_LIGHT, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  lightChar->addDescriptor(new BLE2902());
+
+  ledChar = plantService->createCharacteristic(
+    CHAR_UUID_LED, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  ledChar->setCallbacks(new LedCallbacks());
+
+  pumpChar = plantService->createCharacteristic(
+    CHAR_UUID_PUMP, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  pumpChar->setCallbacks(new PumpCallbacks());
+
+  ssidChar = plantService->createCharacteristic(
+    CHAR_UUID_WIFI_SSID, BLECharacteristic::PROPERTY_WRITE);
+  ssidChar->setCallbacks(new SSIDCallback());
+
+  passChar = plantService->createCharacteristic(
+    CHAR_UUID_WIFI_PASS, BLECharacteristic::PROPERTY_WRITE);
+  passChar->setCallbacks(new PASSCallback());
+
+  nameChar = plantService->createCharacteristic(
+    CHAR_UUID_NAME, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  nameChar->setCallbacks(new NAMECallback());
+
+  timeChar = plantService->createCharacteristic(
+    CHAR_UUID_TIME, BLECharacteristic::PROPERTY_WRITE);
+  timeChar->setCallbacks(new TimeCallbacks());
+
+  profileChar = plantService->createCharacteristic(
+    CHAR_UUID_PROFILE, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_READ);
+  profileChar->setCallbacks(new ProfileCallbacks());
+
+  modeChar = plantService->createCharacteristic(
+    CHAR_UUID_MODE, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
+  modeChar->addDescriptor(new BLE2902());
+  modeChar->setCallbacks(new ModeCallbacks());
+
+  // Wartości początkowe
+  uint16_t h = 0, l = 0;
+  humidityChar->setValue((uint8_t*)&h, 2);
+  lightChar->setValue((uint8_t*)&l, 2);
+  ledChar->setValue(&ledPWM, 1);
+  pumpChar->setValue(&pumpState, 1);
+  { uint8_t tmp = autoMode; modeChar->setValue(&tmp, 1); }
+
+  const char* suffixPtr = strstr(deviceName, "garden_");
+  if (suffixPtr) {
+    suffixPtr += 7;
+    nameChar->setValue(suffixPtr);
+  }
+
+  plantService->start();
+
+  // Advertising
+  adv = BLEDevice::getAdvertising();
+  buildAndApplyAdvertising(deviceName);
+
+  // Setup stempla do liczenia DLT
+  lastLitMs = millis();
+
+  Serial.printf("BLE ready, device name: %s\n", deviceName);
+}
+
+void loop() {
+  if (deviceConnected && (millis() - lastNotifyTime > notifyInterval)) {
+    lastNotifyTime = millis();
+
+    uint16_t soil = analogRead(SOIL_ADC);
+    float luxF = lightSensor.readLightLevel();
+    uint16_t lux = (luxF < 0) ? 0 : (luxF > 65535 ? 65535 : (uint16_t)luxF);
+
+    humidityChar->setValue((uint8_t*)&soil, 2);
+    lightChar->setValue((uint8_t*)&lux, 2);
+    humidityChar->notify();
+    lightChar->notify();
+  }
+
+  maybeResetDailyBudget();
+
+  if (autoMode == 1) {
+    bool allow = canLightNow();
+    float luxF = lightSensor.readLightLevel(); if (luxF < 0) luxF = 0;
+
+    if (allow && litSecondsToday < dltTargetSec()) {
+      float err = (float)targetLux - luxF;
+      integ += err * KI; if (integ < -50) integ = -50; if (integ > 50) integ = 50;
+      float pwmF = (float)ledPWM + KP * err + integ;
+      if (pwmF < 0) pwmF = 0; if (pwmF > 255) pwmF = 255;
+      uint8_t newPWM = (uint8_t)(pwmF + 0.5f);
+      ledPWM = newPWM;
+      ledcWrite(LED_PIN, ledPWM);
+
+      uint32_t nowMs = millis();
+      if (ledPWM > 5) {
+        uint32_t dt = nowMs - lastLitMs;             
+        litSecondsToday += dt / 1000U;           
+        if (litSecondsToday > dltTargetSec()) {
+          litSecondsToday = dltTargetSec();
+        }
+      }
+      lastLitMs = nowMs;
+    } else {
+      ledPWM = 0;
+      ledcWrite(LED_PIN, 0);
+    }
+
+    int soilAdc = analogRead(SOIL_ADC);
+    uint8_t soilPct = soilPctFromAdc(soilAdc);
+    if (millis() > pumpCooldownUntil) {
+      if (soilPct < moistThreshPct) {
+        digitalWrite(PUMP_PIN, HIGH); pumpState = 1;
+        delay(PUMP_RUN_MS);
+        digitalWrite(PUMP_PIN, LOW);  pumpState = 0;
+        pumpCooldownUntil = millis() + PUMP_COOLDOWN_MS;
+      }
+    }
+  }
+
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(300);
+    if (pendingAdvRestart) {
+      pendingAdvRestart = false;
+      adv->start();
+      Serial.println("BLE advertising restarted with updated name");
+    } else {
+      pServer->startAdvertising();
+      Serial.println("BLE advertising resumed");
+    }
+    oldDeviceConnected = deviceConnected;
+  }
+
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+    Serial.println("BLE client connected");
+  }
+
+  if (WiFi.status() == WL_CONNECTED && !wifiConnectedPrinted) {
+    wifiConnectedPrinted = true;
+    Serial.print("📡 Connected to WiFi! IP address: ");
+    Serial.println(WiFi.localIP());
+  }
+}
